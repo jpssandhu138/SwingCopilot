@@ -3,11 +3,13 @@ import uuid
 import json
 import urllib.parse
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime
 import requests
 import pandas as pd
 import yfinance as yf
 import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
 from google import genai
 from google.genai import types
 
@@ -20,18 +22,94 @@ st.set_page_config(
     layout="wide"
 )
 
-AI_REC_CSV = "ai_recommendations.csv"
-HUMAN_DEC_CSV = "human_decisions.csv"
-PERF_XLSX = "weekly_performance.xlsx"
+AI_REC_TAB = "ai_recommendations"
+HUMAN_DEC_TAB = "human_decisions"
+
+AI_REC_COLS = [
+    "week_id", "generated_at", "risk_profile", "ticker", "company_name",
+    "market_cap_tier", "buy_price", "stop_loss_price", "target_price",
+    "tech_5d_return_pct", "ai_sentiment_score", "ai_risk_detected",
+    "ai_catalyst", "ai_thesis_summary", "passed_ai_filter"
+]
+
+HUMAN_DEC_COLS = [
+    "decision_id", "week_id", "decision_timestamp", "risk_profile",
+    "ticker", "company_name", "buy_price", "stop_loss_price",
+    "target_price", "human_decision"
+]
 
 # ==========================================
-# 2. 5-TIER RISK PROFILE & NSE UNIVERSE
+# 2. GOOGLE SHEETS CLOUD DATABASE HELPERS
+# ==========================================
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+@st.cache_resource
+def get_spreadsheet():
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]),
+        scopes=SCOPES
+    )
+    client = gspread.authorize(creds)
+    return client.open_by_url(st.secrets["GSHEET_URL"])
+
+def read_tab_df(tab_name: str, expected_cols: list[str]) -> pd.DataFrame:
+    sh = get_spreadsheet()
+    try:
+        ws = sh.worksheet(tab_name)
+        records = ws.get_all_records()
+        if not records:
+            return pd.DataFrame(columns=expected_cols)
+        df = pd.DataFrame(records)
+        for col in expected_cols:
+            if col not in df.columns:
+                df[col] = ""
+        return df[expected_cols]
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=tab_name, rows=1000, cols=len(expected_cols))
+        ws.append_row(expected_cols)
+        return pd.DataFrame(columns=expected_cols)
+
+def write_tab_df(tab_name: str, df: pd.DataFrame):
+    sh = get_spreadsheet()
+    try:
+        ws = sh.worksheet(tab_name)
+        ws.clear()
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=tab_name, rows=1000, cols=max(1, len(df.columns)))
+
+    clean_df = df.fillna("")
+    rows = [clean_df.columns.tolist()] + clean_df.astype(str).values.tolist()
+    ws.update(range_name="A1", values=rows)
+
+def write_friday_report_tab(tab_name: str, summary_df: pd.DataFrame, audit_df: pd.DataFrame):
+    sh = get_spreadsheet()
+    try:
+        ws = sh.worksheet(tab_name)
+        ws.clear()
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=tab_name, rows=200, cols=15)
+
+    rows = [["COHORT PERFORMANCE SUMMARY"]]
+    rows.append(summary_df.columns.tolist())
+    rows.extend(summary_df.fillna("").astype(str).values.tolist())
+    rows.append([])
+    rows.append(["TRADE-BY-TRADE RESOLUTION AUDIT"])
+    rows.append(audit_df.columns.tolist())
+    rows.extend(audit_df.fillna("").astype(str).values.tolist())
+
+    ws.update(range_name="A1", values=rows)
+
+# ==========================================
+# 3. 5-TIER RISK PROFILE & NSE UNIVERSE
 # ==========================================
 RISK_PROFILES = {
     "Very Low": {
         "description": "Top Safest Blue-Chips (Low-Beta Nifty Leaders). Zero tolerance for negative news.",
-        "stop_loss_pct": 0.015,   # -1.5%
-        "target_pct": 0.030,      # +3.0%
+        "stop_loss_pct": 0.015,
+        "target_pct": 0.030,
         "min_sentiment": 0.50,
         "ai_rule": "Extremely conservative. Flag risk_detected=true on ANY hint of margin pressure, regulatory scrutiny, sector headwinds, or mixed commentary.",
         "universe": {
@@ -49,8 +127,8 @@ RISK_PROFILES = {
     },
     "Low": {
         "description": "Nifty 50 Large Caps. Strict filter; vetoes regulatory, legal, or earnings miss news.",
-        "stop_loss_pct": 0.020,   # -2.0%
-        "target_pct": 0.040,      # +4.0%
+        "stop_loss_pct": 0.020,
+        "target_pct": 0.040,
         "min_sentiment": 0.35,
         "ai_rule": "Conservative. Flag risk_detected=true if there are legal disputes, regulatory notices, management exits, or weak demand signals.",
         "universe": {
@@ -68,8 +146,8 @@ RISK_PROFILES = {
     },
     "Medium": {
         "description": "Nifty 100 (Large + Upper Mid-Cap). Balanced risk-reward; allows neutral news if momentum is strong.",
-        "stop_loss_pct": 0.025,   # -2.5%
-        "target_pct": 0.050,      # +5.0%
+        "stop_loss_pct": 0.025,
+        "target_pct": 0.050,
         "min_sentiment": 0.20,
         "ai_rule": "Balanced swing trader. Flag risk_detected=true only for material adverse events like SEBI penalties, earnings misses, or major downgrades.",
         "universe": {
@@ -87,8 +165,8 @@ RISK_PROFILES = {
     },
     "High": {
         "description": "Nifty Midcap 150. Aggressive momentum; accepts volatility unless severe fraud/SEBI risk exists.",
-        "stop_loss_pct": 0.035,   # -3.5%
-        "target_pct": 0.075,      # +7.5%
+        "stop_loss_pct": 0.035,
+        "target_pct": 0.075,
         "min_sentiment": 0.10,
         "ai_rule": "Aggressive momentum trader. Ignore minor market noise; only flag risk_detected=true for severe earnings shocks, fraud, or regulatory bans.",
         "universe": {
@@ -106,8 +184,8 @@ RISK_PROFILES = {
     },
     "Very High": {
         "description": "Broad Market + Nifty Smallcap 250. High-beta breakouts; only vetoes catastrophic governance events.",
-        "stop_loss_pct": 0.050,   # -5.0%
-        "target_pct": 0.100,      # +10.0%
+        "stop_loss_pct": 0.050,
+        "target_pct": 0.100,
         "min_sentiment": 0.00,
         "ai_rule": "High-risk small-cap speculator. Only flag risk_detected=true for insolvency, auditor resignation, raids, or catastrophic corporate governance failure.",
         "universe": {
@@ -125,27 +203,6 @@ RISK_PROFILES = {
     }
 }
 
-# ==========================================
-# 3. STORAGE INITIALIZATION HELPERS
-# ==========================================
-def init_csv_files():
-    if not os.path.exists(AI_REC_CSV):
-        pd.DataFrame(columns=[
-            "week_id", "generated_at", "risk_profile", "ticker", "company_name",
-            "market_cap_tier", "buy_price", "stop_loss_price", "target_price",
-            "tech_5d_return_pct", "ai_sentiment_score", "ai_risk_detected",
-            "ai_catalyst", "ai_thesis_summary", "passed_ai_filter"
-        ]).to_csv(AI_REC_CSV, index=False)
-
-    if not os.path.exists(HUMAN_DEC_CSV):
-        pd.DataFrame(columns=[
-            "decision_id", "week_id", "decision_timestamp", "risk_profile",
-            "ticker", "company_name", "buy_price", "stop_loss_price",
-            "target_price", "human_decision"
-        ]).to_csv(HUMAN_DEC_CSV, index=False)
-
-init_csv_files()
-
 def get_current_week_id() -> str:
     now = datetime.now()
     return f"{now.year}-W{now.isocalendar()[1]:02d}"
@@ -154,7 +211,6 @@ def get_current_week_id() -> str:
 # 4. NEWS SCRAPER & GEMINI RISK ENGINE
 # ==========================================
 def fetch_indian_stock_news(company_name: str) -> list[str]:
-    """Fetches top 5 recent Google News RSS headlines for an Indian stock."""
     try:
         query = urllib.parse.quote(f"{company_name} share news India")
         rss_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
@@ -165,7 +221,6 @@ def fetch_indian_stock_news(company_name: str) -> list[str]:
         return []
 
 def evaluate_with_gemini(api_key: str, ticker: str, company_name: str, risk_level: str) -> dict:
-    """Evaluates recent news using Gemini 2.5 Flash calibrated to the selected Risk Profile."""
     headlines = fetch_indian_stock_news(company_name)
     if not headlines:
         return {
@@ -215,7 +270,7 @@ def evaluate_with_gemini(api_key: str, ticker: str, company_name: str, risk_leve
 # ==========================================
 # 5. WORKFLOW 1: SUNDAY EVENING SCREENER
 # ==========================================
-def run_sunday_workflow(api_key: str, selected_risk: str, week_id: str):
+def run_sunday_workflow(api_key: str, selected_risk: str, week_id: str) -> int:
     profile = RISK_PROFILES[selected_risk]
     universe = profile["universe"]
     sl_pct = profile["stop_loss_pct"]
@@ -233,21 +288,16 @@ def run_sunday_workflow(api_key: str, selected_risk: str, week_id: str):
             if len(df) < 20:
                 continue
 
-            close_series = df["Close"]
-            if isinstance(close_series, pd.DataFrame):
-                close_series = close_series.iloc[:, 0]
-
+            close_series = df["Close"].iloc[:, 0] if isinstance(df["Close"], pd.DataFrame) else df["Close"]
             curr_price = float(close_series.iloc[-1])
             sma_20 = float(close_series.rolling(window=20).mean().iloc[-1])
             price_5d_ago = float(close_series.iloc[-5])
             ret_5d_pct = round(((curr_price - price_5d_ago) / price_5d_ago) * 100, 2)
 
-            # Technical Filter: Price > 20 SMA and positive 5-day momentum
             if curr_price > sma_20 and ret_5d_pct > 0:
                 ai_res = evaluate_with_gemini(api_key, ticker, comp_name, selected_risk)
                 sent_score = float(ai_res.get("sentiment_score", 0.0))
                 risk_flag = bool(ai_res.get("risk_detected", False))
-
                 passed_ai = (not risk_flag) and (sent_score >= min_sent)
 
                 buy_price = round(curr_price, 2)
@@ -277,11 +327,11 @@ def run_sunday_workflow(api_key: str, selected_risk: str, week_id: str):
     progress.empty()
 
     if new_rows:
-        existing_df = pd.read_csv(AI_REC_CSV)
-        # Remove prior runs for the same week_id + risk_profile to prevent duplicate clutter
-        existing_df = existing_df[~((existing_df["week_id"] == week_id) & (existing_df["risk_profile"] == selected_risk))]
+        existing_df = read_tab_df(AI_REC_TAB, AI_REC_COLS)
+        if not existing_df.empty:
+            existing_df = existing_df[~((existing_df["week_id"].astype(str) == str(week_id)) & (existing_df["risk_profile"].astype(str) == str(selected_risk)))]
         updated_df = pd.concat([existing_df, pd.DataFrame(new_rows)], ignore_index=True)
-        updated_df.to_csv(AI_REC_CSV, index=False)
+        write_tab_df(AI_REC_TAB, updated_df)
         return len(new_rows)
     return 0
 
@@ -289,14 +339,14 @@ def run_sunday_workflow(api_key: str, selected_risk: str, week_id: str):
 # 6. HUMAN DECISION LOGGING
 # ==========================================
 def log_human_decision(row: pd.Series, decision: str):
-    dec_df = pd.read_csv(HUMAN_DEC_CSV)
-    # Remove existing decision for same week + ticker + risk_profile if user changes mind
-    mask = (
-        (dec_df["week_id"] == row["week_id"]) &
-        (dec_df["ticker"] == row["ticker"]) &
-        (dec_df["risk_profile"] == row["risk_profile"])
-    )
-    dec_df = dec_df[~mask]
+    dec_df = read_tab_df(HUMAN_DEC_TAB, HUMAN_DEC_COLS)
+    if not dec_df.empty:
+        mask = (
+            (dec_df["week_id"].astype(str) == str(row["week_id"])) &
+            (dec_df["ticker"].astype(str) == str(row["ticker"])) &
+            (dec_df["risk_profile"].astype(str) == str(row["risk_profile"]))
+        )
+        dec_df = dec_df[~mask]
 
     new_entry = pd.DataFrame([{
         "decision_id": str(uuid.uuid4())[:8],
@@ -312,13 +362,12 @@ def log_human_decision(row: pd.Series, decision: str):
     }])
 
     updated = pd.concat([dec_df, new_entry], ignore_index=True)
-    updated.to_csv(HUMAN_DEC_CSV, index=False)
+    write_tab_df(HUMAN_DEC_TAB, updated)
 
 # ==========================================
 # 7. WORKFLOW 2: FRIDAY PERFORMANCE EVALUATOR
 # ==========================================
-def evaluate_single_trade(ticker: str, buy_price: float, stop_loss: float, target: float, sim_mode: bool = False):
-    """Fetches last 5 trading days of high/low/close to resolve weekly trade outcome."""
+def evaluate_single_trade(ticker: str, buy_price: float, stop_loss: float, target: float):
     try:
         df = yf.download(ticker, period="5d", interval="1d", progress=False)
         if df.empty:
@@ -332,7 +381,6 @@ def evaluate_single_trade(ticker: str, buy_price: float, stop_loss: float, targe
         week_high = round(float(highs.max()), 2)
         fri_close = round(float(closes.iloc[-1]), 2)
 
-        # Conservative resolution: check Stop-Loss first, then Target, else Friday Close
         if week_low <= stop_loss:
             exit_price = stop_loss
             reason = "STOP_LOSS_HIT"
@@ -349,29 +397,34 @@ def evaluate_single_trade(ticker: str, buy_price: float, stop_loss: float, targe
         return buy_price, buy_price, buy_price, buy_price, "NO_DATA", 0.0
 
 def run_friday_evaluation(week_id: str, risk_profile: str):
-    ai_df = pd.read_csv(AI_REC_CSV)
-    dec_df = pd.read_csv(HUMAN_DEC_CSV)
+    ai_df = read_tab_df(AI_REC_TAB, AI_REC_COLS)
+    dec_df = read_tab_df(HUMAN_DEC_TAB, HUMAN_DEC_COLS)
 
-    week_ai = ai_df[(ai_df["week_id"] == week_id) & (ai_df["risk_profile"] == risk_profile)].copy()
+    week_ai = ai_df[(ai_df["week_id"].astype(str) == str(week_id)) & (ai_df["risk_profile"].astype(str) == str(risk_profile))].copy()
     if week_ai.empty:
         return None, None
 
-    week_dec = dec_df[(dec_df["week_id"] == week_id) & (dec_df["risk_profile"] == risk_profile)]
-    yes_tickers = set(week_dec[week_dec["human_decision"] == "YES"]["ticker"].tolist())
+    week_dec = dec_df[(dec_df["week_id"].astype(str) == str(week_id)) & (dec_df["risk_profile"].astype(str) == str(risk_profile))]
+    yes_tickers = set(week_dec[week_dec["human_decision"].astype(str) == "YES"]["ticker"].tolist()) if not week_dec.empty else set()
 
     trade_audit_rows = []
     for _, row in week_ai.iterrows():
+        b_price = float(row["buy_price"])
+        sl_price = float(row["stop_loss_price"])
+        tp_price = float(row["target_price"])
+        passed_flag = str(row["passed_ai_filter"]).strip().lower() == "true"
+
         w_low, w_high, f_close, ex_price, ex_reason, net_ret = evaluate_single_trade(
-            row["ticker"], row["buy_price"], row["stop_loss_price"], row["target_price"]
+            row["ticker"], b_price, sl_price, tp_price
         )
         trade_audit_rows.append({
             "Ticker": row["ticker"],
             "Company": row["company_name"],
-            "Passed_AI_Filter": bool(row["passed_ai_filter"]),
+            "Passed_AI_Filter": passed_flag,
             "Human_Approved_YES": row["ticker"] in yes_tickers,
-            "Buy_Price": row["buy_price"],
-            "Stop_Loss": row["stop_loss_price"],
-            "Target": row["target_price"],
+            "Buy_Price": b_price,
+            "Stop_Loss": sl_price,
+            "Target": tp_price,
             "Week_Low": w_low,
             "Week_High": w_high,
             "Friday_Close": f_close,
@@ -403,27 +456,16 @@ def run_friday_evaluation(week_id: str, risk_profile: str):
             "Stop_Loss_Hits": sl_hits
         }
 
-    # Cohort 1: Without AI (All stocks that passed Sunday technicals, ignoring AI veto)
     c_no_ai = summarize_cohort(audit_df, "1. Without AI (Pure Technical Baseline)")
-    # Cohort 2: With AI (Only stocks where passed_ai_filter == True)
     c_with_ai = summarize_cohort(audit_df[audit_df["Passed_AI_Filter"] == True], "2. With AI (Model Recommendations)")
-    # Cohort 3: Human + AI (Only stocks where user clicked YES)
     c_human = summarize_cohort(audit_df[audit_df["Human_Approved_YES"] == True], "3. Human Confirmed (YES Triggers)")
 
     summary_df = pd.DataFrame([c_no_ai, c_with_ai, c_human])
     baseline_ret = c_no_ai["Avg_Return_Pct"]
     summary_df["Alpha_vs_No_AI_Pct"] = round(summary_df["Avg_Return_Pct"] - baseline_ret, 2)
 
-    # Save to multi-tab Excel file (1 tab per week_id + risk_profile)
-    sheet_name = f"{week_id}_{risk_profile.replace(' ', '')}"[:31]
-    mode = "a" if os.path.exists(PERF_XLSX) else "w"
-    writer_kwargs = {"path": PERF_XLSX, "engine": "openpyxl", "mode": mode}
-    if mode == "a":
-        writer_kwargs["if_sheet_exists"] = "replace"
-
-    with pd.ExcelWriter(**writer_kwargs) as writer:
-        summary_df.to_excel(writer, sheet_name=sheet_name, startrow=1, index=False)
-        audit_df.to_excel(writer, sheet_name=sheet_name, startrow=len(summary_df) + 5, index=False)
+    report_tab_name = f"{week_id}_{risk_profile.replace(' ', '')}"[:31]
+    write_friday_report_tab(report_tab_name, summary_df, audit_df)
 
     return summary_df, audit_df
 
@@ -431,17 +473,22 @@ def run_friday_evaluation(week_id: str, risk_profile: str):
 # 8. STREAMLIT UI LAYOUT
 # ==========================================
 st.title("📈 SwingCopilot AI — Retail Equity Decision & Risk Engine")
-st.caption("Human-in-the-Loop Weekly NSE Swing Trading System | Powered by Gemini 2.5 Flash")
+st.caption("Human-in-the-Loop Weekly NSE Swing Trading System | Live Google Sheets Cloud Database")
+
+default_gemini_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
 
 with st.sidebar:
     st.header("⚙️ System Configuration")
     gemini_api_key = st.text_input(
         "Gemini API Key",
-        value=os.environ.get("GEMINI_API_KEY", ""),
+        value=default_gemini_key,
         type="password",
-        help="Get a free key from aistudio.google.com"
+        help="Auto-loaded from Streamlit Secrets if configured"
     )
     active_week = st.text_input("Active Week ID", value=get_current_week_id())
+
+    if "GSHEET_URL" in st.secrets:
+        st.link_button("🔗 Open Live Google Sheet DB", st.secrets["GSHEET_URL"], use_container_width=True)
 
     st.divider()
     st.subheader("🛡️ Dynamic Risk Filter")
@@ -467,7 +514,7 @@ with st.sidebar:
 tab1, tab2, tab3 = st.tabs([
     "🌅 1. Sunday Screening & Human Approval",
     "📊 2. Friday Performance & AI vs. Non-AI Audit",
-    "🗂️ 3. Raw CSV & Excel Data Logs"
+    "🗂️ 3. Google Sheets Live Data Inspector"
 ])
 
 # ------------------------------------------
@@ -477,42 +524,43 @@ with tab1:
     col_head, col_btn = st.columns([3, 1])
     with col_head:
         st.subheader(f"Sunday Pre-Market Screening ({selected_risk} Risk)")
-        st.write("Screens parent universe for technical momentum, audits weekend news via Gemini, and generates trade cards for human confirmation.")
+        st.write("Screens parent universe for technical momentum, audits weekend news via Gemini, and syncs recommendations to Google Sheets.")
     with col_btn:
         if st.button("🚀 Run Sunday Scan Now", type="primary", use_container_width=True):
             if not gemini_api_key:
-                st.error("Please enter your Gemini API Key in the sidebar first.")
+                st.error("Please configure your Gemini API Key in Streamlit Secrets or the sidebar.")
             else:
                 count = run_sunday_workflow(gemini_api_key, selected_risk, active_week)
-                st.success(f"Scanned universe! Logged {count} technical candidates to `{AI_REC_CSV}`.")
+                st.success(f"Scanned universe! Synced {count} technical candidates to `{AI_REC_TAB}` tab in Google Sheets.")
 
     st.divider()
 
-    ai_df = pd.read_csv(AI_REC_CSV)
-    dec_df = pd.read_csv(HUMAN_DEC_CSV)
+    ai_df = read_tab_df(AI_REC_TAB, AI_REC_COLS)
+    dec_df = read_tab_df(HUMAN_DEC_TAB, HUMAN_DEC_COLS)
 
     current_candidates = ai_df[
-        (ai_df["week_id"] == active_week) &
-        (ai_df["risk_profile"] == selected_risk)
-    ]
+        (ai_df["week_id"].astype(str) == str(active_week)) &
+        (ai_df["risk_profile"].astype(str) == str(selected_risk))
+    ] if not ai_df.empty else pd.DataFrame()
 
     if current_candidates.empty:
         st.warning(f"No recommendations generated yet for **{active_week}** under **{selected_risk}** risk. Click **Run Sunday Scan Now** above.")
     else:
-        recommended_df = current_candidates[current_candidates["passed_ai_filter"] == True]
-        vetoed_df = current_candidates[current_candidates["passed_ai_filter"] == False]
+        passed_mask = current_candidates["passed_ai_filter"].astype(str).str.strip().str.lower() == "true"
+        recommended_df = current_candidates[passed_mask]
+        vetoed_df = current_candidates[~passed_mask]
 
         st.markdown(f"### ✅ AI-Approved Trade Thesis Cards ({len(recommended_df)} Picks)")
         if recommended_df.empty:
             st.info("All technical candidates were vetoed by the Gemini Risk Filter for this risk tier.")
 
         for _, row in recommended_df.iterrows():
-            # Check if human already decided
             existing_dec = dec_df[
-                (dec_df["week_id"] == active_week) &
-                (dec_df["ticker"] == row["ticker"]) &
-                (dec_df["risk_profile"] == selected_risk)
-            ]
+                (dec_df["week_id"].astype(str) == str(active_week)) &
+                (dec_df["ticker"].astype(str) == str(row["ticker"])) &
+                (dec_df["risk_profile"].astype(str) == str(selected_risk))
+            ] if not dec_df.empty else pd.DataFrame()
+
             current_status = existing_dec["human_decision"].iloc[-1] if not existing_dec.empty else "PENDING"
 
             with st.container(border=True):
@@ -526,7 +574,8 @@ with tab1:
                     m1.metric("Buy Price", f"₹{row['buy_price']}")
                     m2.metric("Stop-Loss", f"₹{row['stop_loss_price']}")
                     m3.metric("Target", f"₹{row['target_price']}")
-                    st.progress(max(0.0, min(1.0, ( float(row['ai_sentiment_score']) + 1 ) / 2)), text=f"AI Sentiment Score: {row['ai_sentiment_score']}")
+                    sent_val = float(row['ai_sentiment_score']) if row['ai_sentiment_score'] != "" else 0.0
+                    st.progress(max(0.0, min(1.0, (sent_val + 1) / 2)), text=f"AI Sentiment Score: {sent_val}")
                 with c3:
                     st.markdown("**Human Confirmation:**")
                     if current_status == "YES":
@@ -544,7 +593,7 @@ with tab1:
                         log_human_decision(row, "NO")
                         st.rerun()
 
-        with st.expander(f"🛡️ Counterfactual Audit: {len(vetoed_df)} Stocks Vetoed by AI Risk Filter (Tracked for Friday 'Without AI' Comparison)"):
+        with st.expander(f"🛡️ Counterfactual Audit: {len(vetoed_df)} Stocks Vetoed by AI Risk Filter"):
             if not vetoed_df.empty:
                 st.dataframe(vetoed_df[[
                     "ticker", "company_name", "buy_price", "tech_5d_return_pct",
@@ -558,57 +607,57 @@ with tab1:
 # ------------------------------------------
 with tab2:
     st.subheader("Friday Post-Market Performance & A/B Cohort Benchmark")
-    st.write("Compares **1. Pure Technical Baseline (Without AI)** vs. **2. AI Recommendations** vs. **3. Human Confirmed Trades (`YES`)** and writes to a dedicated weekly tab in `weekly_performance.xlsx`.")
+    st.write("Compares **1. Pure Technical Baseline (Without AI)** vs. **2. AI Recommendations** vs. **3. Human Confirmed Trades (`YES`)** and writes to a new weekly tab in Google Sheets.")
 
-    if st.button("📈 Run Friday Evaluation & Update Excel Sheet", type="primary"):
+    if st.button("📈 Run Friday Evaluation & Sync to Google Sheets", type="primary"):
         summary_df, audit_df = run_friday_evaluation(active_week, selected_risk)
         if summary_df is None:
             st.error(f"No Sunday data found for {active_week} ({selected_risk}). Run the Sunday scan first.")
         else:
-            st.success(f"Saved evaluation to `{PERF_XLSX}` under tab `{active_week}_{selected_risk.replace(' ', '')}`!")
+            st.success(f"Evaluation synced to Google Sheet tab `{active_week}_{selected_risk.replace(' ', '')}`!")
 
-    if os.path.exists(PERF_XLSX):
-        excel_file = pd.ExcelFile(PERF_XLSX)
-        selected_tab = st.selectbox("Select Historical Week Tab from Excel Workbook:", options=excel_file.sheet_names[::-1])
+    sh = get_spreadsheet()
+    all_tabs = [ws.title for ws in sh.worksheets() if ws.title not in [AI_REC_TAB, HUMAN_DEC_TAB, "Sheet1"]]
 
+    if all_tabs:
+        selected_tab = st.selectbox("Select Historical Weekly Report Tab from Google Sheets:", options=all_tabs[::-1])
         if selected_tab:
-            raw_sheet = pd.read_excel(PERF_XLSX, sheet_name=selected_tab)
-            st.markdown(f"#### 🏆 Cohort Performance Summary (`{selected_tab}`)")
-            # Extract top summary rows (first 3 rows after header)
-            summary_view = pd.read_excel(PERF_XLSX, sheet_name=selected_tab, skiprows=1, nrows=3)
-            st.dataframe(summary_view, use_container_width=True)
+            ws_vals = sh.worksheet(selected_tab).get_all_values()
+            if len(ws_vals) >= 5:
+                sum_headers = ws_vals[1]
+                sum_rows = ws_vals[2:5]
+                summary_view = pd.DataFrame(sum_rows, columns=sum_headers)
 
-            # KPI Metrics Row
-            if len(summary_view) == 3:
+                st.markdown(f"#### 🏆 Cohort Performance Summary (`{selected_tab}`)")
+                st.dataframe(summary_view, use_container_width=True)
+
                 k1, k2, k3 = st.columns(3)
-                no_ai_ret = summary_view.iloc[0]["Avg_Return_Pct"]
-                ai_ret = summary_view.iloc[1]["Avg_Return_Pct"]
-                hum_ret = summary_view.iloc[2]["Avg_Return_Pct"]
+                no_ai_ret = float(summary_view.iloc[0]["Avg_Return_Pct"])
+                ai_ret = float(summary_view.iloc[1]["Avg_Return_Pct"])
+                hum_ret = float(summary_view.iloc[2]["Avg_Return_Pct"])
 
                 k1.metric("1. Without AI (Technical Baseline)", f"{no_ai_ret}%", f"Win Rate: {summary_view.iloc[0]['Win_Rate_Pct']}%")
                 k2.metric("2. With AI (Gemini Filtered)", f"{ai_ret}%", f"{round(ai_ret - no_ai_ret, 2)}% Alpha vs No-AI")
                 k3.metric("3. Human Approved (YES Picks)", f"{hum_ret}%", f"{round(hum_ret - ai_ret, 2)}% vs Raw AI")
 
-            st.markdown("#### 🔍 Trade-by-Trade Resolution Audit")
-            audit_view = pd.read_excel(PERF_XLSX, sheet_name=selected_tab, skiprows=7)
-            st.dataframe(audit_view, use_container_width=True)
-
-            with open(PERF_XLSX, "rb") as f:
-                st.download_button("📥 Download Full Multi-Tab Excel Report (.xlsx)", f, file_name=PERF_XLSX)
+            if len(ws_vals) >= 8:
+                st.markdown("#### 🔍 Trade-by-Trade Resolution Audit")
+                aud_headers = ws_vals[7]
+                aud_rows = ws_vals[8:]
+                audit_view = pd.DataFrame(aud_rows, columns=aud_headers)
+                st.dataframe(audit_view, use_container_width=True)
 
 # ------------------------------------------
-# TAB 3: RAW CSV INSPECTOR
+# TAB 3: RAW GOOGLE SHEETS INSPECTOR
 # ------------------------------------------
 with tab3:
     c_left, c_right = st.columns(2)
     with c_left:
-        st.markdown("### 📄 Sheet 1: `ai_recommendations.csv`")
-        df1 = pd.read_csv(AI_REC_CSV)
+        st.markdown(f"### 📄 Tab 1: `{AI_REC_TAB}`")
+        df1 = read_tab_df(AI_REC_TAB, AI_REC_COLS)
         st.dataframe(df1, use_container_width=True)
-        st.download_button("Download AI Recommendations CSV", df1.to_csv(index=False), file_name=AI_REC_CSV)
 
     with c_right:
-        st.markdown("### 👤 Sheet 2: `human_decisions.csv`")
-        df2 = pd.read_csv(HUMAN_DEC_CSV)
+        st.markdown(f"### 👤 Tab 2: `{HUMAN_DEC_TAB}`")
+        df2 = read_tab_df(HUMAN_DEC_TAB, HUMAN_DEC_COLS)
         st.dataframe(df2, use_container_width=True)
-        st.download_button("Download Human Decisions CSV", df2.to_csv(index=False), file_name=HUMAN_DEC_CSV)
