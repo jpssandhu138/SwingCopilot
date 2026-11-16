@@ -2,5 +2,6 @@ streamlit
 yfinance
 google-genai
 pandas
-openpyxl
 requests
+gspread
+google-auth
