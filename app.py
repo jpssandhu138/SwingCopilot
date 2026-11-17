@@ -9,6 +9,7 @@ import pandas as pd
 import yfinance as yf
 import streamlit as st
 import gspread
+from PIL import Image
 from google.oauth2.service_account import Credentials
 from google import genai
 from google.genai import types
@@ -21,26 +22,6 @@ st.set_page_config(
     page_icon="📈",
     layout="wide"
 )
-
-# Remove excessive top padding & blend logo smoothly
-st.markdown("""
-    <style>
-        .block-container { padding-top: 1.5rem; }
-        header[data-testid="stHeader"] { background: transparent; }
-    </style>
-""", unsafe_allow_html=True)
-
-if os.path.exists("logo.png"):
-    from PIL import Image
-    img = Image.open("logo.png")
-    w, h = img.size
-    # Crop out empty top/bottom navy padding and the bottom-right watermark star
-    cropped = img.crop((int(w * 0.08), int(h * 0.25), int(w * 0.90), int(h * 0.72)))
-    st.image(cropped, width=420)
-else:
-    st.title("📈 SwingCopilot AI — Retail Equity Decision & Risk Engine")
-
-st.caption("Human-in-the-Loop Weekly NSE Swing Trading System | Live Google Sheets Cloud Database")
 
 AI_REC_TAB = "ai_recommendations"
 HUMAN_DEC_TAB = "human_decisions"
@@ -490,9 +471,52 @@ def run_friday_evaluation(week_id: str, risk_profile: str):
     return summary_df, audit_df
 
 # ==========================================
-# 8. STREAMLIT UI LAYOUT
+# 8. DYNAMIC UI COMPONENT HELPERS
 # ==========================================
-st.title("📈 SwingCopilot AI — Retail Equity Decision & Risk Engine")
+def format_dynamic_price_card(label: str, price_val, accent_color: str = "#FFFFFF") -> str:
+    """Formats INR prices and dynamically scales font size based on digit count so numbers never truncate."""
+    try:
+        num = float(price_val)
+        formatted = f"₹{num:,.1f}" if num >= 10000 else f"₹{num:,.2f}"
+    except (ValueError, TypeError):
+        formatted = f"₹{price_val}"
+
+    char_len = len(formatted)
+    if char_len <= 7:          # e.g., ₹401.40
+        font_size = "1.45rem"
+    elif char_len <= 9:        # e.g., ₹3,245.50
+        font_size = "1.18rem"
+    else:                      # e.g., ₹14,890.5
+        font_size = "1.00rem"
+
+    return f"""
+    <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 8px; padding: 8px 10px; text-align: left;">
+        <div style="font-size: 0.78rem; color: #9CA3AF; margin-bottom: 2px;">{label}</div>
+        <div style="font-size: {font_size}; font-weight: 700; color: {accent_color};
+                    white-space: nowrap; letter-spacing: -0.3px;">{formatted}</div>
+    </div>
+    """
+
+# ==========================================
+# 9. STREAMLIT UI LAYOUT
+# ==========================================
+st.markdown("""
+    <style>
+        .block-container { padding-top: 1.5rem; }
+        header[data-testid="stHeader"] { background: transparent; }
+    </style>
+""", unsafe_allow_html=True)
+
+if os.path.exists("logo.png"):
+    img = Image.open("logo.png")
+    w, h = img.size
+    # Crop out empty top/bottom padding and the bottom-right watermark star
+    cropped = img.crop((int(w * 0.08), int(h * 0.25), int(w * 0.90), int(h * 0.72)))
+    st.image(cropped, width=420)
+else:
+    st.title("📈 SwingCopilot AI — Retail Equity Decision & Risk Engine")
+
 st.caption("Human-in-the-Loop Weekly NSE Swing Trading System | Live Google Sheets Cloud Database")
 
 default_gemini_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
@@ -584,16 +608,18 @@ with tab1:
             current_status = existing_dec["human_decision"].iloc[-1] if not existing_dec.empty else "PENDING"
 
             with st.container(border=True):
-                c1, c2, c3 = st.columns([2.5, 2, 1.5])
+                c1, c2, c3 = st.columns([2.2, 2.5, 1.4])
                 with c1:
                     st.markdown(f"#### {row['company_name']} (`{row['ticker']}`)")
                     st.caption(f"Tier: **{row['market_cap_tier']}** | Catalyst: `{row['ai_catalyst']}` | 5D Momentum: **+{row['tech_5d_return_pct']}%**")
                     st.write(f"**AI Thesis:** {row['ai_thesis_summary']}")
                 with c2:
                     m1, m2, m3 = st.columns(3)
-                    m1.metric("Buy Price", f"₹{row['buy_price']}")
-                    m2.metric("Stop-Loss", f"₹{row['stop_loss_price']}")
-                    m3.metric("Target", f"₹{row['target_price']}")
+                    m1.markdown(format_dynamic_price_card("Buy Price", row["buy_price"], "#F9FAFB"), unsafe_allow_html=True)
+                    m2.markdown(format_dynamic_price_card("Stop-Loss", row["stop_loss_price"], "#F87171"), unsafe_allow_html=True)
+                    m3.markdown(format_dynamic_price_card("Target", row["target_price"], "#34D399"), unsafe_allow_html=True)
+
+                    st.write("")
                     sent_val = float(row['ai_sentiment_score']) if row['ai_sentiment_score'] != "" else 0.0
                     st.progress(max(0.0, min(1.0, (sent_val + 1) / 2)), text=f"AI Sentiment Score: {sent_val}")
                 with c3:
