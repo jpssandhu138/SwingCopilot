@@ -22,10 +22,25 @@ st.set_page_config(
     layout="wide"
 )
 
+# Remove excessive top padding & blend logo smoothly
+st.markdown("""
+    <style>
+        .block-container { padding-top: 1.5rem; }
+        header[data-testid="stHeader"] { background: transparent; }
+    </style>
+""", unsafe_allow_html=True)
+
 if os.path.exists("logo.png"):
-    st.image("logo.png", width=450)
+    from PIL import Image
+    img = Image.open("logo.png")
+    w, h = img.size
+    # Crop out empty top/bottom navy padding and the bottom-right watermark star
+    cropped = img.crop((int(w * 0.08), int(h * 0.25), int(w * 0.90), int(h * 0.72)))
+    st.image(cropped, width=420)
 else:
     st.title("📈 SwingCopilot AI — Retail Equity Decision & Risk Engine")
+
+st.caption("Human-in-the-Loop Weekly NSE Swing Trading System | Live Google Sheets Cloud Database")
 
 AI_REC_TAB = "ai_recommendations"
 HUMAN_DEC_TAB = "human_decisions"
