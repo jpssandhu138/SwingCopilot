@@ -1,10 +1,12 @@
 import os
+import math
 import uuid
 import json
 import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime
 import requests
+import numpy as np
 import pandas as pd
 import yfinance as yf
 import streamlit as st
@@ -18,29 +20,72 @@ from google.genai import types
 # 1. PAGE CONFIG & CONSTANTS
 # ==========================================
 st.set_page_config(
-    page_title="SwingCopilot AI | NSE Decision Engine",
-    page_icon="📈",
+    page_title="SwingCopilot AI | Intraday Alpha Engine",
+    page_icon="⚡",
     layout="wide"
 )
 
-AI_REC_TAB = "ai_recommendations"
-HUMAN_DEC_TAB = "human_decisions"
+INTRADAY_REC_TAB = "intraday_recommendations"
+INTRADAY_DEC_TAB = "intraday_decisions"
 
-AI_REC_COLS = [
-    "week_id", "generated_at", "risk_profile", "ticker", "company_name",
-    "market_cap_tier", "buy_price", "stop_loss_price", "target_price",
-    "tech_5d_return_pct", "ai_sentiment_score", "ai_risk_detected",
-    "ai_catalyst", "ai_thesis_summary", "passed_ai_filter"
+INTRADAY_REC_COLS = [
+    "date_id", "generated_at", "risk_profile", "ticker", "company_name",
+    "matched_pattern", "pattern_variance", "rvol_score", "prob_hit_sl_pct", "prob_hit_tp_pct",
+    "buy_price", "stop_loss_price", "target_price",
+    "ai_sentiment_score", "ai_risk_detected", "ai_catalyst", "ai_thesis_summary", "passed_ai_filter"
 ]
 
-HUMAN_DEC_COLS = [
-    "decision_id", "week_id", "decision_timestamp", "risk_profile",
-    "ticker", "company_name", "buy_price", "stop_loss_price",
-    "target_price", "human_decision"
+INTRADAY_DEC_COLS = [
+    "decision_id", "date_id", "decision_timestamp", "risk_profile",
+    "ticker", "company_name", "buy_price", "stop_loss_price", "target_price", "human_decision"
 ]
 
 # ==========================================
-# 2. GOOGLE SHEETS CLOUD DATABASE HELPERS
+# 2. ONE-TIME PRE-DEFINED TECHNICAL PATTERNS (LOCAL LIBRARY)
+# ==========================================
+# Normalized price arrays (0 to 1 scale over 10 periods) for shape matching / variance calculation
+TEMPLATE_PATTERNS = {
+    "Bull Flag Breakout": [0.3, 0.5, 0.8, 0.9, 0.85, 0.82, 0.83, 0.84, 0.92, 1.0],
+    "Opening Range Breakout (ORB)": [0.5, 0.52, 0.51, 0.53, 0.65, 0.75, 0.8, 0.88, 0.95, 1.0],
+    "Cup and Handle Continuation": [0.8, 0.6, 0.4, 0.42, 0.6, 0.8, 0.82, 0.78, 0.85, 1.0],
+    "V-Bottom Reversal": [1.0, 0.8, 0.5, 0.2, 0.1, 0.3, 0.6, 0.8, 0.9, 1.0],
+    "Consolidation Range": [0.5, 0.52, 0.48, 0.51, 0.49, 0.5, 0.52, 0.49, 0.51, 0.5],
+    "Bearish Breakdown": [0.7, 0.6, 0.5, 0.4, 0.35, 0.3, 0.25, 0.2, 0.15, 0.1]
+}
+
+def match_institutional_pattern(price_series: pd.Series) -> tuple[str, float]:
+    """
+    Computes variance (Euclidean distance) between normalized stock price action
+    and pre-defined institutional templates. Returns the best-matching pattern and variance score.
+    """
+    try:
+        arr = price_series.tail(10).values
+        if len(arr) < 10:
+            return "General Momentum", 0.5
+        
+        # Normalize between 0 and 1
+        min_v, max_v = np.min(arr), np.max(arr)
+        if max_v == min_v:
+            norm_arr = np.ones_like(arr) * 0.5
+        else:
+            norm_arr = (arr - min_v) / (max_v - min_v)
+
+        best_match = "General Momentum"
+        min_variance = float("inf")
+
+        for pat_name, template_vals in TEMPLATE_PATTERNS.items():
+            template_arr = np.array(template_vals)
+            variance = float(np.mean((norm_arr - template_arr) ** 2))
+            if variance < min_variance:
+                min_variance = variance
+                best_match = pat_name
+
+        return best_match, round(min_variance, 4)
+    except Exception:
+        return "General Momentum", 0.5
+
+# ==========================================
+# 3. GOOGLE SHEETS CLOUD DATABASE HELPERS
 # ==========================================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -85,131 +130,70 @@ def write_tab_df(tab_name: str, df: pd.DataFrame):
     rows = [clean_df.columns.tolist()] + clean_df.astype(str).values.tolist()
     ws.update(range_name="A1", values=rows)
 
-def write_friday_report_tab(tab_name: str, summary_df: pd.DataFrame, audit_df: pd.DataFrame):
+def write_squareoff_report_tab(tab_name: str, summary_df: pd.DataFrame, audit_df: pd.DataFrame):
     sh = get_spreadsheet()
     try:
         ws = sh.worksheet(tab_name)
         ws.clear()
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=tab_name, rows=200, cols=15)
+        ws = sh.add_worksheet(title=tab_name, rows=200, cols=16)
 
-    rows = [["COHORT PERFORMANCE SUMMARY"]]
+    rows = [["INTRADAY COHORT PERFORMANCE SUMMARY"]]
     rows.append(summary_df.columns.tolist())
     rows.extend(summary_df.fillna("").astype(str).values.tolist())
     rows.append([])
-    rows.append(["TRADE-BY-TRADE RESOLUTION AUDIT"])
+    rows.append(["INTRADAY TRADE-BY-TRADE RESOLUTION AUDIT"])
     rows.append(audit_df.columns.tolist())
     rows.extend(audit_df.fillna("").astype(str).values.tolist())
 
     ws.update(range_name="A1", values=rows)
 
 # ==========================================
-# 3. 5-TIER RISK PROFILE & NSE UNIVERSE
+# 4. MASTER UNIVERSE & INTRADAY RISK PROFILES
 # ==========================================
-RISK_PROFILES = {
-    "Very Low": {
-        "description": "Top Safest Blue-Chips (Low-Beta Nifty Leaders). Zero tolerance for negative news.",
-        "stop_loss_pct": 0.015,
-        "target_pct": 0.030,
-        "min_sentiment": 0.50,
-        "ai_rule": "Extremely conservative. Flag risk_detected=true on ANY hint of margin pressure, regulatory scrutiny, sector headwinds, or mixed commentary.",
-        "universe": {
-            "TCS.NS": ("Tata Consultancy Services", "Blue-Chip"),
-            "HDFCBANK.NS": ("HDFC Bank", "Blue-Chip"),
-            "INFY.NS": ("Infosys", "Blue-Chip"),
-            "ITC.NS": ("ITC Limited", "Blue-Chip"),
-            "HINDUNILVR.NS": ("Hindustan Unilever", "Blue-Chip"),
-            "RELIANCE.NS": ("Reliance Industries", "Blue-Chip"),
-            "ICICIBANK.NS": ("ICICI Bank", "Blue-Chip"),
-            "SBIN.NS": ("State Bank of India", "Blue-Chip"),
-            "BHARTIARTL.NS": ("Bharti Airtel", "Blue-Chip"),
-            "LT.NS": ("Larsen & Toubro", "Blue-Chip")
-        }
+MASTER_UNIVERSE = {
+    "RELIANCE.NS": "Reliance Industries", "TCS.NS": "Tata Consultancy Services",
+    "HDFCBANK.NS": "HDFC Bank", "INFY.NS": "Infosys", "ICICIBANK.NS": "ICICI Bank",
+    "SBIN.NS": "State Bank of India", "BHARTIARTL.NS": "Bharti Airtel",
+    "LT.NS": "Larsen & Toubro", "ITC.NS": "ITC Limited", "AXISBANK.NS": "Axis Bank",
+    "TATAMOTORS.NS": "Tata Motors", "MARUTI.NS": "Maruti Suzuki",
+    "SUNPHARMA.NS": "Sun Pharmaceutical", "TITAN.NS": "Titan Company",
+    "ZOMATO.NS": "Zomato", "HAL.NS": "Hindustan Aeronautics", "BEL.NS": "Bharat Electronics",
+    "TRENT.NS": "Trent Limited", "DIXON.NS": "Dixon Technologies", "SUZLON.NS": "Suzlon Energy"
+}
+
+INTRADAY_RISK_PROFILES = {
+    "Conservative": {
+        "stop_loss_pct": 0.005,   # -0.5% tight intraday SL
+        "target_pct": 0.012,      # +1.2% intraday TP
+        "max_variance": 0.12,     # Strict pattern fit required
+        "min_rvol": 1.5,          # High volume confirmation
+        "min_sentiment": 0.40
     },
-    "Low": {
-        "description": "Nifty 50 Large Caps. Strict filter; vetoes regulatory, legal, or earnings miss news.",
-        "stop_loss_pct": 0.020,
-        "target_pct": 0.040,
-        "min_sentiment": 0.35,
-        "ai_rule": "Conservative. Flag risk_detected=true if there are legal disputes, regulatory notices, management exits, or weak demand signals.",
-        "universe": {
-            "SUNPHARMA.NS": ("Sun Pharmaceutical", "Large-Cap"),
-            "MARUTI.NS": ("Maruti Suzuki", "Large-Cap"),
-            "AXISBANK.NS": ("Axis Bank", "Large-Cap"),
-            "KOTAKBANK.NS": ("Kotak Mahindra Bank", "Large-Cap"),
-            "TITAN.NS": ("Titan Company", "Large-Cap"),
-            "ULTRACEMCO.NS": ("UltraTech Cement", "Large-Cap"),
-            "BAJFINANCE.NS": ("Bajaj Finance", "Large-Cap"),
-            "M&M.NS": ("Mahindra & Mahindra", "Large-Cap"),
-            "NTPC.NS": ("NTPC Limited", "Large-Cap"),
-            "POWERGRID.NS": ("Power Grid Corp", "Large-Cap")
-        }
+    "Balanced": {
+        "stop_loss_pct": 0.007,   # -0.7% SL
+        "target_pct": 0.018,      # +1.8% TP
+        "max_variance": 0.20,
+        "min_rvol": 1.2,
+        "min_sentiment": 0.20
     },
-    "Medium": {
-        "description": "Nifty 100 (Large + Upper Mid-Cap). Balanced risk-reward; allows neutral news if momentum is strong.",
-        "stop_loss_pct": 0.025,
-        "target_pct": 0.050,
-        "min_sentiment": 0.20,
-        "ai_rule": "Balanced swing trader. Flag risk_detected=true only for material adverse events like SEBI penalties, earnings misses, or major downgrades.",
-        "universe": {
-            "TATAMOTORS.NS": ("Tata Motors", "Large-Cap"),
-            "ZOMATO.NS": ("Zomato", "Large-Cap"),
-            "DLF.NS": ("DLF Limited", "Large-Cap"),
-            "HAL.NS": ("Hindustan Aeronautics", "Large-Cap"),
-            "BEL.NS": ("Bharat Electronics", "Large-Cap"),
-            "TRENT.NS": ("Trent Limited", "Large-Cap"),
-            "INDHOTEL.NS": ("Indian Hotels Co", "Mid-Cap"),
-            "CHOLAFIN.NS": ("Cholamandalam Investment", "Mid-Cap"),
-            "PIDILITIND.NS": ("Pidilite Industries", "Large-Cap"),
-            "SIEMENS.NS": ("Siemens India", "Large-Cap")
-        }
-    },
-    "High": {
-        "description": "Nifty Midcap 150. Aggressive momentum; accepts volatility unless severe fraud/SEBI risk exists.",
-        "stop_loss_pct": 0.035,
-        "target_pct": 0.075,
-        "min_sentiment": 0.10,
-        "ai_rule": "Aggressive momentum trader. Ignore minor market noise; only flag risk_detected=true for severe earnings shocks, fraud, or regulatory bans.",
-        "universe": {
-            "PERSISTENT.NS": ("Persistent Systems", "Mid-Cap"),
-            "COFORGE.NS": ("Coforge Limited", "Mid-Cap"),
-            "DIXON.NS": ("Dixon Technologies", "Mid-Cap"),
-            "POLYCAB.NS": ("Polycab India", "Mid-Cap"),
-            "KEI.NS": ("KEI Industries", "Mid-Cap"),
-            "KPITTECH.NS": ("KPIT Technologies", "Mid-Cap"),
-            "FEDERALBNK.NS": ("Federal Bank", "Mid-Cap"),
-            "IDFCFIRSTB.NS": ("IDFC First Bank", "Mid-Cap"),
-            "CUMMINSIND.NS": ("Cummins India", "Mid-Cap"),
-            "MAXHEALTH.NS": ("Max Healthcare", "Mid-Cap")
-        }
-    },
-    "Very High": {
-        "description": "Broad Market + Nifty Smallcap 250. High-beta breakouts; only vetoes catastrophic governance events.",
-        "stop_loss_pct": 0.050,
-        "target_pct": 0.100,
-        "min_sentiment": 0.00,
-        "ai_rule": "High-risk small-cap speculator. Only flag risk_detected=true for insolvency, auditor resignation, raids, or catastrophic corporate governance failure.",
-        "universe": {
-            "SUZLON.NS": ("Suzlon Energy", "Small-Cap"),
-            "CDSL.NS": ("Central Depository Services", "Small-Cap"),
-            "BSE.NS": ("BSE Limited", "Mid-Cap"),
-            "MCX.NS": ("Multi Commodity Exchange", "Small-Cap"),
-            "ANGELONE.NS": ("Angel One", "Small-Cap"),
-            "SONACOMS.NS": ("Sona BLW Precision", "Mid-Cap"),
-            "KAYNES.NS": ("Kaynes Technology", "Small-Cap"),
-            "DATA-PATTERNS.NS": ("Data Patterns India", "Small-Cap"),
-            "TEJASNET.NS": ("Tejas Networks", "Small-Cap"),
-            "JYOTHYLAB.NS": ("Jyothy Labs", "Small-Cap")
-        }
+    "Aggressive Breakout": {
+        "stop_loss_pct": 0.010,   # -1.0% SL
+        "target_pct": 0.025,      # +2.5% TP
+        "max_variance": 0.35,
+        "min_rvol": 1.0,
+        "min_sentiment": 0.00
     }
 }
 
-def get_current_week_id() -> str:
-    now = datetime.now()
-    return f"{now.year}-W{now.isocalendar()[1]:02d}"
+def get_current_date_id() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 # ==========================================
-# 4. NEWS SCRAPER & GEMINI RISK ENGINE
+# 5. NEWS SCRAPER & GEMINI DRIFT EXTRACTION
 # ==========================================
 def fetch_indian_stock_news(company_name: str) -> list[str]:
     try:
@@ -221,38 +205,28 @@ def fetch_indian_stock_news(company_name: str) -> list[str]:
     except Exception:
         return []
 
-def evaluate_with_gemini(api_key: str, ticker: str, company_name: str, risk_level: str) -> dict:
+def evaluate_intraday_with_gemini(api_key: str, ticker: str, company_name: str, pattern: str, variance: float, rvol: float) -> dict:
     headlines = fetch_indian_stock_news(company_name)
-    if not headlines:
-        return {
-            "sentiment_score": 0.25,
-            "risk_detected": False,
-            "catalyst": "Technical Momentum (No recent news)",
-            "summary": "No major news catalysts found; trade relies purely on positive price action."
-        }
+    news_text = "\n".join([f"- {h}" for h in headlines]) if headlines else "No major overnight news."
 
     client = genai.Client(api_key=api_key)
-    risk_cfg = RISK_PROFILES[risk_level]
-    news_text = "\n".join([f"- {h}" for h in headlines])
-
     prompt = f"""
-    You are an AI Equity Risk Analyst evaluating Indian stock '{company_name}' ({ticker}) for a 1-week swing trade (Monday Open to Friday Close).
+    You are an AI Intraday Quantitative Trader evaluating Indian stock '{company_name}' ({ticker}) for next-day intraday trading.
+    Matched Technical Pattern: {pattern} (Variance score: {variance})
+    Relative Volume (RVOL): {rvol}x
     
-    ACTIVE USER RISK PROFILE: {risk_level}
-    RISK MANDATE: {risk_cfg['ai_rule']}
-    
-    Recent Headlines:
+    Overnight/Recent Headlines:
     {news_text}
 
     Return strict JSON with these exact keys:
     {{
         "sentiment_score": float between -1.0 and 1.0,
-        "risk_detected": boolean (true if news violates the Risk Mandate above),
-        "catalyst": string (One of: "Earnings", "Regulatory", "Macro/Sector", "Order Win/Expansion", "Corporate Governance", "General Momentum"),
-        "summary": string (1 crisp sentence explaining the bull/bear catalyst)
+        "risk_detected": boolean (true if news indicates regulatory penalties, fraud, or negative gap-down risk),
+        "catalyst": string (e.g., "Earnings Beat", "Major Contract Win", "Sector Momentum", "Technical Breakout"),
+        "news_drift_shift_pct": float between -2.0 and 2.5 (expected opening gap/drift contribution),
+        "summary": string (1 crisp sentence explaining intraday thesis)
     }}
     """
-
     try:
         response = client.models.generate_content(
             model="gemini-3.8-flash",
@@ -262,88 +236,129 @@ def evaluate_with_gemini(api_key: str, ticker: str, company_name: str, risk_leve
         return json.loads(response.text)
     except Exception as e:
         return {
-            "sentiment_score": 0.0,
+            "sentiment_score": 0.1,
             "risk_detected": False,
-            "catalyst": "API Fallback",
-            "summary": f"AI evaluation skipped or rate-limited ({str(e)[:40]})."
+            "catalyst": "Pattern Momentum",
+            "news_drift_shift_pct": 0.0,
+            "summary": f"Fallback intraday setup based on {pattern} structure."
         }
 
 # ==========================================
-# 5. WORKFLOW 1: SUNDAY EVENING SCREENER
+# 6. WORKFLOW: NIGHTLY INTRADAY SCANNER
 # ==========================================
-def run_sunday_workflow(api_key: str, selected_risk: str, week_id: str) -> int:
-    profile = RISK_PROFILES[selected_risk]
-    universe = profile["universe"]
+def run_intraday_scan(api_key: str, selected_risk: str, date_id: str) -> int:
+    profile = INTRADAY_RISK_PROFILES[selected_risk]
     sl_pct = profile["stop_loss_pct"]
     tp_pct = profile["target_pct"]
+    max_var = profile["max_variance"]
+    min_rvol = profile["min_rvol"]
     min_sent = profile["min_sentiment"]
 
-    new_rows = []
-    progress = st.progress(0, text="Scanning NSE universe & running Gemini risk audit...")
-    total = len(universe)
+    tickers = list(MASTER_UNIVERSE.keys())
+    progress = st.progress(0.1, text=f"Downloading intraday data and computing pattern variance across {len(tickers)} stocks...")
 
-    for idx, (ticker, (comp_name, cap_tier)) in enumerate(universe.items()):
-        progress.progress((idx + 1) / total, text=f"Evaluating {comp_name} ({ticker})...")
+    batch_df = yf.download(tickers, period="1mo", interval="1d", group_by="ticker", progress=False)
+
+    qualified_set = []
+    for ticker in tickers:
         try:
-            df = yf.download(ticker, period="2mo", interval="1d", progress=False)
-            if len(df) < 20:
+            df = batch_df[ticker].dropna()
+            if len(df) < 15:
                 continue
 
-            close_series = df["Close"].iloc[:, 0] if isinstance(df["Close"], pd.DataFrame) else df["Close"]
+            close_series = df["Close"]
+            vol_series = df["Volume"]
             curr_price = float(close_series.iloc[-1])
-            sma_20 = float(close_series.rolling(window=20).mean().iloc[-1])
-            price_5d_ago = float(close_series.iloc[-5])
-            ret_5d_pct = round(((curr_price - price_5d_ago) / price_5d_ago) * 100, 2)
+            
+            # Compute RVOL (Today's volume vs 20-day average volume)
+            avg_vol = float(vol_series.tail(20).mean())
+            curr_vol = float(vol_series.iloc[-1])
+            rvol = round(curr_vol / max(1.0, avg_vol), 2)
 
-            if curr_price > sma_20 and ret_5d_pct > 0:
-                ai_res = evaluate_with_gemini(api_key, ticker, comp_name, selected_risk)
-                sent_score = float(ai_res.get("sentiment_score", 0.0))
-                risk_flag = bool(ai_res.get("risk_detected", False))
-                passed_ai = (not risk_flag) and (sent_score >= min_sent)
+            # Pattern Matching
+            matched_pat, variance = match_institutional_pattern(close_series)
 
-                buy_price = round(curr_price, 2)
-                stop_loss = round(buy_price * (1 - sl_pct), 2)
-                target = round(buy_price * (1 + tp_pct), 2)
-
-                new_rows.append({
-                    "week_id": week_id,
-                    "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "risk_profile": selected_risk,
-                    "ticker": ticker,
-                    "company_name": comp_name,
-                    "market_cap_tier": cap_tier,
-                    "buy_price": buy_price,
-                    "stop_loss_price": stop_loss,
-                    "target_price": target,
-                    "tech_5d_return_pct": ret_5d_pct,
-                    "ai_sentiment_score": sent_score,
-                    "ai_risk_detected": risk_flag,
-                    "ai_catalyst": ai_res.get("catalyst", "Momentum"),
-                    "ai_thesis_summary": ai_res.get("summary", ""),
-                    "passed_ai_filter": passed_ai
-                })
+            if variance <= max_var and rvol >= min_rvol and ("Bull" in matched_pat or "ORB" in matched_pat or "V-Bottom" in matched_pat):
+                qualified_set.append((ticker, curr_price, matched_pat, variance, rvol, close_series))
         except Exception:
             continue
+
+    qualified_set.sort(key=lambda x: x[3]) # Sort by lowest variance (best pattern match)
+    qualified_set = qualified_set[:10]
+
+    new_rows = []
+    total_q = len(qualified_set)
+    for idx, (ticker, curr_price, matched_pat, variance, rvol, close_series) in enumerate(qualified_set):
+        comp_name = MASTER_UNIVERSE[ticker]
+        progress.progress(
+            0.2 + (0.8 * ((idx + 1) / max(1, total_q))),
+            text=f"Evaluating AI News & Drift ({idx + 1}/{total_q}): {comp_name} ({matched_pat})..."
+        )
+
+        ai_res = evaluate_intraday_with_gemini(api_key, ticker, comp_name, matched_pat, variance, rvol)
+        sent_score = float(ai_res.get("sentiment_score", 0.0))
+        risk_flag = bool(ai_res.get("risk_detected", False))
+        drift_shift = float(ai_res.get("news_drift_shift_pct", 0.0))
+
+        passed_ai = (not risk_flag) and (sent_score >= min_sentiment_check(min_sent))
+
+        # Intraday volatility & barrier touch probability calculation
+        log_rets = np.log(close_series / close_series.shift(1)).dropna()
+        intraday_vol = float(log_rets.std()) / math.sqrt(6.5) # Scaled for intraday hours
+        intraday_vol = max(intraday_vol, 0.002)
+
+        # Adjusted drift incorporating news shift
+        mu_adj = (drift_shift / 100.0)
+        prob_sl = min(99.0, round(2.0 * norm_cdf((-sl_pct - mu_adj) / intraday_vol) * 100.0, 1))
+        prob_tp = min(99.0, round(2.0 * norm_cdf((-tp_pct + mu_adj) / intraday_vol) * 100.0, 1))
+
+        buy_price = round(curr_price, 2)
+        stop_loss = round(buy_price * (1 - sl_pct), 2)
+        target = round(buy_price * (1 + tp_pct), 2)
+
+        new_rows.append({
+            "date_id": date_id,
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "risk_profile": selected_risk,
+            "ticker": ticker,
+            "company_name": comp_name,
+            "matched_pattern": matched_pat,
+            "pattern_variance": variance,
+            "rvol_score": rvol,
+            "prob_hit_sl_pct": prob_sl,
+            "prob_hit_tp_pct": prob_tp,
+            "buy_price": buy_price,
+            "stop_loss_price": stop_loss,
+            "target_price": target,
+            "ai_sentiment_score": sent_score,
+            "ai_risk_detected": risk_flag,
+            "ai_catalyst": ai_res.get("catalyst", "Pattern Breakout"),
+            "ai_thesis_summary": ai_res.get("summary", ""),
+            "passed_ai_filter": passed_ai
+        })
 
     progress.empty()
 
     if new_rows:
-        existing_df = read_tab_df(AI_REC_TAB, AI_REC_COLS)
+        existing_df = read_tab_df(INTRADAY_REC_TAB, INTRADAY_REC_COLS)
         if not existing_df.empty:
-            existing_df = existing_df[~((existing_df["week_id"].astype(str) == str(week_id)) & (existing_df["risk_profile"].astype(str) == str(selected_risk)))]
+            existing_df = existing_df[~((existing_df["date_id"].astype(str) == str(date_id)) & (existing_df["risk_profile"].astype(str) == str(selected_risk)))]
         updated_df = pd.concat([existing_df, pd.DataFrame(new_rows)], ignore_index=True)
-        write_tab_df(AI_REC_TAB, updated_df)
+        write_tab_df(INTRADAY_REC_TAB, updated_df)
         return len(new_rows)
     return 0
 
+def min_sentiment_check(val):
+    return val
+
 # ==========================================
-# 6. HUMAN DECISION LOGGING
+# 7. HUMAN IN THE LOOP DECISION LOGGING
 # ==========================================
-def log_human_decision(row: pd.Series, decision: str):
-    dec_df = read_tab_df(HUMAN_DEC_TAB, HUMAN_DEC_COLS)
+def log_intraday_decision(row: pd.Series, decision: str):
+    dec_df = read_tab_df(INTRADAY_DEC_TAB, INTRADAY_DEC_COLS)
     if not dec_df.empty:
         mask = (
-            (dec_df["week_id"].astype(str) == str(row["week_id"])) &
+            (dec_df["date_id"].astype(str) == str(row["date_id"])) &
             (dec_df["ticker"].astype(str) == str(row["ticker"])) &
             (dec_df["risk_profile"].astype(str) == str(row["risk_profile"]))
         )
@@ -351,7 +366,7 @@ def log_human_decision(row: pd.Series, decision: str):
 
     new_entry = pd.DataFrame([{
         "decision_id": str(uuid.uuid4())[:8],
-        "week_id": row["week_id"],
+        "date_id": row["date_id"],
         "decision_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "risk_profile": row["risk_profile"],
         "ticker": row["ticker"],
@@ -363,143 +378,130 @@ def log_human_decision(row: pd.Series, decision: str):
     }])
 
     updated = pd.concat([dec_df, new_entry], ignore_index=True)
-    write_tab_df(HUMAN_DEC_TAB, updated)
+    write_tab_df(INTRADAY_DEC_TAB, updated)
 
 # ==========================================
-# 7. WORKFLOW 2: FRIDAY PERFORMANCE EVALUATOR
+# 8. SAME-DAY SQUARE-OFF EVALUATOR
 # ==========================================
-def evaluate_single_trade(ticker: str, buy_price: float, stop_loss: float, target: float):
+def evaluate_intraday_squareoff(ticker: str, buy_price: float, stop_loss: float, target: float):
     try:
-        df = yf.download(ticker, period="5d", interval="1d", progress=False)
+        # Pull today's intraday high/low action
+        df = yf.download(ticker, period="1d", interval="5m", progress=False)
         if df.empty:
-            raise ValueError("Empty price dataframe")
-
+            df = yf.download(ticker, period="2d", interval="1d", progress=False)
+            
         lows = df["Low"].iloc[:, 0] if isinstance(df["Low"], pd.DataFrame) else df["Low"]
         highs = df["High"].iloc[:, 0] if isinstance(df["High"], pd.DataFrame) else df["High"]
         closes = df["Close"].iloc[:, 0] if isinstance(df["Close"], pd.DataFrame) else df["Close"]
 
-        week_low = round(float(lows.min()), 2)
-        week_high = round(float(highs.max()), 2)
-        fri_close = round(float(closes.iloc[-1]), 2)
+        day_low = round(float(lows.min()), 2)
+        day_high = round(float(highs.max()), 2)
+        close_price = round(float(closes.iloc[-1]), 2)
 
-        if week_low <= stop_loss:
+        if day_low <= stop_loss:
             exit_price = stop_loss
             reason = "STOP_LOSS_HIT"
-        elif week_high >= target:
+        elif day_high >= target:
             exit_price = target
             reason = "TARGET_HIT"
         else:
-            exit_price = fri_close
-            reason = "FRIDAY_CLOSE_EXIT"
+            exit_price = close_price
+            reason = "AUTO_SQUAREOFF_CLOSE"
 
         net_ret_pct = round(((exit_price - buy_price) / buy_price) * 100, 2)
-        return week_low, week_high, fri_close, exit_price, reason, net_ret_pct
+        return day_low, day_high, exit_price, reason, net_ret_pct
     except Exception:
-        return buy_price, buy_price, buy_price, buy_price, "NO_DATA", 0.0
+        return buy_price, buy_price, buy_price, "NO_DATA", 0.0
 
-def run_friday_evaluation(week_id: str, risk_profile: str):
-    ai_df = read_tab_df(AI_REC_TAB, AI_REC_COLS)
-    dec_df = read_tab_df(HUMAN_DEC_TAB, HUMAN_DEC_COLS)
+def run_squareoff_report(date_id: str, risk_profile: str):
+    rec_df = read_tab_df(INTRADAY_REC_TAB, INTRADAY_REC_COLS)
+    dec_df = read_tab_df(INTRADAY_DEC_TAB, INTRADAY_DEC_COLS)
 
-    week_ai = ai_df[(ai_df["week_id"].astype(str) == str(week_id)) & (ai_df["risk_profile"].astype(str) == str(risk_profile))].copy()
-    if week_ai.empty:
+    day_rec = rec_df[(rec_df["date_id"].astype(str) == str(date_id)) & (rec_df["risk_profile"].astype(str) == str(risk_profile))].copy()
+    if day_rec.empty:
         return None, None
 
-    week_dec = dec_df[(dec_df["week_id"].astype(str) == str(week_id)) & (dec_df["risk_profile"].astype(str) == str(risk_profile))]
-    yes_tickers = set(week_dec[week_dec["human_decision"].astype(str) == "YES"]["ticker"].tolist()) if not week_dec.empty else set()
+    day_dec = dec_df[(dec_df["date_id"].astype(str) == str(date_id)) & (dec_df["risk_profile"].astype(str) == str(risk_profile))]
+    yes_tickers = set(day_dec[day_dec["human_decision"].astype(str) == "YES"]["ticker"].tolist()) if not day_dec.empty else set()
 
-    trade_audit_rows = []
-    for _, row in week_ai.iterrows():
+    audit_rows = []
+    for _, row in day_rec.iterrows():
         b_price = float(row["buy_price"])
         sl_price = float(row["stop_loss_price"])
         tp_price = float(row["target_price"])
         passed_flag = str(row["passed_ai_filter"]).strip().lower() == "true"
 
-        w_low, w_high, f_close, ex_price, ex_reason, net_ret = evaluate_single_trade(
+        d_low, d_high, ex_price, ex_reason, net_ret = evaluate_intraday_squareoff(
             row["ticker"], b_price, sl_price, tp_price
         )
-        trade_audit_rows.append({
+        audit_rows.append({
             "Ticker": row["ticker"],
             "Company": row["company_name"],
+            "Pattern": row["matched_pattern"],
             "Passed_AI_Filter": passed_flag,
             "Human_Approved_YES": row["ticker"] in yes_tickers,
             "Buy_Price": b_price,
             "Stop_Loss": sl_price,
             "Target": tp_price,
-            "Week_Low": w_low,
-            "Week_High": w_high,
-            "Friday_Close": f_close,
+            "Day_Low": d_low,
+            "Day_High": d_high,
             "Exit_Price": ex_price,
             "Exit_Reason": ex_reason,
             "Net_Return_Pct": net_ret
         })
 
-    audit_df = pd.DataFrame(trade_audit_rows)
+    audit_df = pd.DataFrame(audit_rows)
 
-    def summarize_cohort(df_sub: pd.DataFrame, cohort_name: str):
+    def summarize_cohort(df_sub: pd.DataFrame, name: str):
         if df_sub.empty:
-            return {
-                "Cohort": cohort_name,
-                "Total_Trades": 0,
-                "Win_Rate_Pct": 0.0,
-                "Avg_Return_Pct": 0.0,
-                "Max_Drawdown_Pct": 0.0,
-                "Stop_Loss_Hits": 0
-            }
+            return {"Cohort": name, "Trades": 0, "Win_Rate_Pct": 0.0, "Avg_Return_Pct": 0.0, "SL_Hits": 0}
         wins = len(df_sub[df_sub["Net_Return_Pct"] > 0])
         sl_hits = len(df_sub[df_sub["Exit_Reason"] == "STOP_LOSS_HIT"])
         return {
-            "Cohort": cohort_name,
-            "Total_Trades": len(df_sub),
+            "Cohort": name,
+            "Trades": len(df_sub),
             "Win_Rate_Pct": round((wins / len(df_sub)) * 100, 1),
             "Avg_Return_Pct": round(df_sub["Net_Return_Pct"].mean(), 2),
-            "Max_Drawdown_Pct": round(df_sub["Net_Return_Pct"].min(), 2),
-            "Stop_Loss_Hits": sl_hits
+            "SL_Hits": sl_hits
         }
 
-    c_no_ai = summarize_cohort(audit_df, "1. Without AI (Pure Technical Baseline)")
-    c_with_ai = summarize_cohort(audit_df[audit_df["Passed_AI_Filter"] == True], "2. With AI (Model Recommendations)")
-    c_human = summarize_cohort(audit_df[audit_df["Human_Approved_YES"] == True], "3. Human Confirmed (YES Triggers)")
+    c_no_ai = summarize_cohort(audit_df, "1. Without AI (Pattern Baseline)")
+    c_with_ai = summarize_cohort(audit_df[audit_df["Passed_AI_Filter"] == True], "2. With AI (Model Filtered)")
+    c_human = summarize_cohort(audit_df[audit_df["Human_Approved_YES"] == True], "3. Human Confirmed (YES)")
 
     summary_df = pd.DataFrame([c_no_ai, c_with_ai, c_human])
-    baseline_ret = c_no_ai["Avg_Return_Pct"]
-    summary_df["Alpha_vs_No_AI_Pct"] = round(summary_df["Avg_Return_Pct"] - baseline_ret, 2)
+    base_ret = c_no_ai["Avg_Return_Pct"]
+    summary_df["Alpha_vs_Baseline_Pct"] = round(summary_df["Avg_Return_Pct"] - base_ret, 2)
 
-    report_tab_name = f"{week_id}_{risk_profile.replace(' ', '')}"[:31]
-    write_friday_report_tab(report_tab_name, summary_df, audit_df)
+    report_tab_name = f"SQ_{date_id}_{risk_profile.replace(' ', '')}"[:31]
+    write_squareoff_report_tab(report_tab_name, summary_df, audit_df)
 
     return summary_df, audit_df
 
 # ==========================================
-# 8. DYNAMIC UI COMPONENT HELPERS
+# 9. DYNAMIC UI COMPONENT HELPERS
 # ==========================================
-def format_dynamic_price_card(label: str, price_val, accent_color: str = "#FFFFFF") -> str:
-    """Formats INR prices and dynamically scales font size based on digit count so numbers never truncate."""
+def format_dynamic_price_card(label: str, price_val, accent_color: str = "#FFFFFF", sub_badge: str = "") -> str:
     try:
         num = float(price_val)
         formatted = f"₹{num:,.1f}" if num >= 10000 else f"₹{num:,.2f}"
     except (ValueError, TypeError):
         formatted = f"₹{price_val}"
 
-    char_len = len(formatted)
-    if char_len <= 7:          # e.g., ₹401.40
-        font_size = "1.45rem"
-    elif char_len <= 9:        # e.g., ₹3,245.50
-        font_size = "1.18rem"
-    else:                      # e.g., ₹14,890.5
-        font_size = "1.00rem"
+    badge_html = f'<div style="font-size: 0.72rem; color: {accent_color}; opacity: 0.85; margin-top: 2px;">{sub_badge}</div>' if sub_badge else ""
 
     return f"""
     <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08);
                 border-radius: 8px; padding: 8px 10px; text-align: left;">
         <div style="font-size: 0.78rem; color: #9CA3AF; margin-bottom: 2px;">{label}</div>
-        <div style="font-size: {font_size}; font-weight: 700; color: {accent_color};
+        <div style="font-size: 1.25rem; font-weight: 700; color: {accent_color};
                     white-space: nowrap; letter-spacing: -0.3px;">{formatted}</div>
+        {badge_html}
     </div>
     """
 
 # ==========================================
-# 9. STREAMLIT UI LAYOUT
+# 10. STREAMLIT UI LAYOUT
 # ==========================================
 st.markdown("""
     <style>
@@ -511,13 +513,12 @@ st.markdown("""
 if os.path.exists("logo.png"):
     img = Image.open("logo.png")
     w, h = img.size
-    # Crop out empty top/bottom padding and the bottom-right watermark star
     cropped = img.crop((int(w * 0.08), int(h * 0.25), int(w * 0.90), int(h * 0.72)))
     st.image(cropped, width=420)
 else:
-    st.title("📈 SwingCopilot AI — Retail Equity Decision & Risk Engine")
+    st.title("⚡ SwingCopilot AI — Intraday Alpha & Pattern Engine")
 
-st.caption("Human-in-the-Loop Weekly NSE Swing Trading System | Live Google Sheets Cloud Database")
+st.caption("Nightly Intraday Pattern Matching & Same-Day Square-Off Engine | Live Google Sheets Cloud Database")
 
 default_gemini_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
 
@@ -526,81 +527,72 @@ with st.sidebar:
     gemini_api_key = st.text_input(
         "Gemini API Key",
         value=default_gemini_key,
-        type="password",
-        help="Auto-loaded from Streamlit Secrets if configured"
+        type="password"
     )
-    active_week = st.text_input("Active Week ID", value=get_current_week_id())
+    active_date = st.text_input("Trading Date ID (YYYY-MM-DD)", value=get_current_date_id())
 
     if "GSHEET_URL" in st.secrets:
         st.link_button("🔗 Open Live Google Sheet DB", st.secrets["GSHEET_URL"], use_container_width=True)
 
     st.divider()
-    st.subheader("🛡️ Dynamic Risk Filter")
+    st.subheader("⚡ Intraday Risk Profile")
     selected_risk = st.select_slider(
-        "Select Portfolio Risk Appetite:",
-        options=["Very Low", "Low", "Medium", "High", "Very High"],
-        value="Medium"
+        "Select Profile:",
+        options=["Conservative", "Balanced", "Aggressive Breakout"],
+        value="Balanced"
     )
 
-    risk_info = RISK_PROFILES[selected_risk]
+    risk_info = INTRADAY_RISK_PROFILES[selected_risk]
     st.info(
-        f"**{selected_risk} Risk Profile**\n\n"
-        f"• **Universe:** {risk_info['description']}\n"
+        f"**{selected_risk} Intraday Setup**\n\n"
+        f"• **Target:** +{risk_info['target_pct']*100:.1f}%\n"
         f"• **Stop-Loss:** -{risk_info['stop_loss_pct']*100:.1f}%\n"
-        f"• **Profit Target:** +{risk_info['target_pct']*100:.1f}%\n"
-        f"• **Min AI Sentiment:** {risk_info['min_sentiment']}"
+        f"• **Max Pattern Variance:** ≤{risk_info['max_variance']}\n"
+        f"• **Min RVOL:** ≥{risk_info['min_rvol']}x"
     )
-
-    with st.expander("View Parent NSE Stock List"):
-        for t, (c_name, tier) in risk_info["universe"].items():
-            st.markdown(f"- `{t}`: {c_name} *({tier})*")
 
 tab1, tab2, tab3 = st.tabs([
-    "🌅 1. Sunday Screening & Human Approval",
-    "📊 2. Friday Performance & AI vs. Non-AI Audit",
-    "🗂️ 3. Google Sheets Live Data Inspector"
+    "🌅 1. Nightly Scan & Intraday Approval",
+    "📊 2. Same-Day Square-Off & Audit",
+    "🗂️ 3. Google Sheets Live Inspector"
 ])
 
 # ------------------------------------------
-# TAB 1: SUNDAY WORKFLOW & YES/NO CARDS
+# TAB 1: NIGHTLY SCAN & APPROVAL
 # ------------------------------------------
 with tab1:
-    col_head, col_btn = st.columns([3, 1])
-    with col_head:
-        st.subheader(f"Sunday Pre-Market Screening ({selected_risk} Risk)")
-        st.write("Screens parent universe for technical momentum, audits weekend news via Gemini, and syncs recommendations to Google Sheets.")
-    with col_btn:
-        if st.button("🚀 Run Sunday Scan Now", type="primary", use_container_width=True):
+    c_h, c_b = st.columns([3, 1])
+    with c_h:
+        st.subheader(f"Pre-Market Intraday Screening ({selected_risk})")
+        st.write("Scans technical pattern variance against pre-defined templates, calculates RVOL, extracts overnight news drift, and prepares intraday setups.")
+    with c_b:
+        if st.button("🚀 Run Nightly Intraday Scan", type="primary", use_container_width=True):
             if not gemini_api_key:
-                st.error("Please configure your Gemini API Key in Streamlit Secrets or the sidebar.")
+                st.error("Please configure your Gemini API Key.")
             else:
-                count = run_sunday_workflow(gemini_api_key, selected_risk, active_week)
-                st.success(f"Scanned universe! Synced {count} technical candidates to `{AI_REC_TAB}` tab in Google Sheets.")
+                count = run_intraday_scan(gemini_api_key, selected_risk, active_date)
+                st.success(f"Scan complete! Synced {count} intraday setups to `{INTRADAY_REC_TAB}`.")
 
     st.divider()
 
-    ai_df = read_tab_df(AI_REC_TAB, AI_REC_COLS)
-    dec_df = read_tab_df(HUMAN_DEC_TAB, HUMAN_DEC_COLS)
+    rec_df = read_tab_df(INTRADAY_REC_TAB, INTRADAY_REC_COLS)
+    dec_df = read_tab_df(INTRADAY_DEC_TAB, INTRADAY_DEC_COLS)
 
-    current_candidates = ai_df[
-        (ai_df["week_id"].astype(str) == str(active_week)) &
-        (ai_df["risk_profile"].astype(str) == str(selected_risk))
-    ] if not ai_df.empty else pd.DataFrame()
+    day_candidates = rec_df[
+        (rec_df["date_id"].astype(str) == str(active_date)) &
+        (rec_df["risk_profile"].astype(str) == str(selected_risk))
+    ] if not rec_df.empty else pd.DataFrame()
 
-    if current_candidates.empty:
-        st.warning(f"No recommendations generated yet for **{active_week}** under **{selected_risk}** risk. Click **Run Sunday Scan Now** above.")
+    if day_candidates.empty:
+        st.warning(f"No intraday recommendations generated yet for **{active_date}** under **{selected_risk}** profile.")
     else:
-        passed_mask = current_candidates["passed_ai_filter"].astype(str).str.strip().str.lower() == "true"
-        recommended_df = current_candidates[passed_mask]
-        vetoed_df = current_candidates[~passed_mask]
+        passed_mask = day_candidates["passed_ai_filter"].astype(str).str.strip().str.lower() == "true"
+        approved_df = day_candidates[passed_mask]
 
-        st.markdown(f"### ✅ AI-Approved Trade Thesis Cards ({len(recommended_df)} Picks)")
-        if recommended_df.empty:
-            st.info("All technical candidates were vetoed by the Gemini Risk Filter for this risk tier.")
-
-        for _, row in recommended_df.iterrows():
+        st.markdown(f"### ✅ AI-Approved Intraday Setups ({len(approved_df)} Picks)")
+        for _, row in approved_df.iterrows():
             existing_dec = dec_df[
-                (dec_df["week_id"].astype(str) == str(active_week)) &
+                (dec_df["date_id"].astype(str) == str(active_date)) &
                 (dec_df["ticker"].astype(str) == str(row["ticker"])) &
                 (dec_df["risk_profile"].astype(str) == str(selected_risk))
             ] if not dec_df.empty else pd.DataFrame()
@@ -611,99 +603,69 @@ with tab1:
                 c1, c2, c3 = st.columns([2.2, 2.5, 1.4])
                 with c1:
                     st.markdown(f"#### {row['company_name']} (`{row['ticker']}`)")
-                    st.caption(f"Tier: **{row['market_cap_tier']}** | Catalyst: `{row['ai_catalyst']}` | 5D Momentum: **+{row['tech_5d_return_pct']}%**")
-                    st.write(f"**AI Thesis:** {row['ai_thesis_summary']}")
+                    st.caption(
+                        f"Pattern: **{row['matched_pattern']}** (Var: {row['pattern_variance']}) | "
+                        f"RVOL: **{row['rvol_score']}x** | Catalyst: `{row['ai_catalyst']}`"
+                    )
+                    st.write(f"**Intraday Thesis:** {row['ai_thesis_summary']}")
                 with c2:
                     m1, m2, m3 = st.columns(3)
-                    m1.markdown(format_dynamic_price_card("Buy Price", row["buy_price"], "#F9FAFB"), unsafe_allow_html=True)
-                    m2.markdown(format_dynamic_price_card("Stop-Loss", row["stop_loss_price"], "#F87171"), unsafe_allow_html=True)
-                    m3.markdown(format_dynamic_price_card("Target", row["target_price"], "#34D399"), unsafe_allow_html=True)
-
-                    st.write("")
-                    sent_val = float(row['ai_sentiment_score']) if row['ai_sentiment_score'] != "" else 0.0
-                    st.progress(max(0.0, min(1.0, (sent_val + 1) / 2)), text=f"AI Sentiment Score: {sent_val}")
+                    m1.markdown(format_dynamic_price_card("Buy / Open", row["buy_price"], "#F9FAFB", "Entry"), unsafe_allow_html=True)
+                    m2.markdown(format_dynamic_price_card("Stop-Loss", row["stop_loss_price"], "#F87171", f"P(SL): {row['prob_hit_sl_pct']}%"), unsafe_allow_html=True)
+                    m3.markdown(format_dynamic_price_card("Target", row["target_price"], "#34D399", f"P(TP): {row['prob_hit_tp_pct']}%"), unsafe_allow_html=True)
                 with c3:
-                    st.markdown("**Human Confirmation:**")
+                    st.markdown("**Action:**")
                     if current_status == "YES":
-                        st.success("🟢 Triggered (YES)")
+                        st.success("🟢 Active (YES)")
                     elif current_status == "NO":
-                        st.error("🔴 Rejected (NO)")
+                        st.error("🔴 Skipped (NO)")
                     else:
-                        st.warning("⏳ Awaiting Decision")
+                        st.warning("⏳ Pending")
 
                     b_yes, b_no = st.columns(2)
-                    if b_yes.button("YES ✅", key=f"yes_{row['ticker']}_{selected_risk}", use_container_width=True):
-                        log_human_decision(row, "YES")
+                    if b_yes.button("YES ✅", key=f"iyes_{row['ticker']}_{selected_risk}", use_container_width=True):
+                        log_intraday_decision(row, "YES")
                         st.rerun()
-                    if b_no.button("NO ❌", key=f"no_{row['ticker']}_{selected_risk}", use_container_width=True):
-                        log_human_decision(row, "NO")
+                    if b_no.button("NO ❌", key=f"ino_{row['ticker']}_{selected_risk}", use_container_width=True):
+                        log_intraday_decision(row, "NO")
                         st.rerun()
-
-        with st.expander(f"🛡️ Counterfactual Audit: {len(vetoed_df)} Stocks Vetoed by AI Risk Filter"):
-            if not vetoed_df.empty:
-                st.dataframe(vetoed_df[[
-                    "ticker", "company_name", "buy_price", "tech_5d_return_pct",
-                    "ai_sentiment_score", "ai_risk_detected", "ai_thesis_summary"
-                ]], use_container_width=True)
-            else:
-                st.write("No stocks were vetoed in this batch.")
 
 # ------------------------------------------
-# TAB 2: FRIDAY EVALUATION & COHORT ANALYSIS
+# TAB 2: SAME-DAY SQUARE-OFF & AUDIT
 # ------------------------------------------
 with tab2:
-    st.subheader("Friday Post-Market Performance & A/B Cohort Benchmark")
-    st.write("Compares **1. Pure Technical Baseline (Without AI)** vs. **2. AI Recommendations** vs. **3. Human Confirmed Trades (`YES`)** and writes to a new weekly tab in Google Sheets.")
+    st.subheader("Market Close Square-Off & Performance Audit")
+    st.write("Resolves whether intraday target or stop-loss was hit before market close (3:30 PM IST), auto-squares off positions, and logs performance to Google Sheets.")
 
-    if st.button("📈 Run Friday Evaluation & Sync to Google Sheets", type="primary"):
-        summary_df, audit_df = run_friday_evaluation(active_week, selected_risk)
+    if st.button("🏁 Run Market Close Square-Off & Sync", type="primary"):
+        summary_df, audit_df = run_squareoff_report(active_date, selected_risk)
         if summary_df is None:
-            st.error(f"No Sunday data found for {active_week} ({selected_risk}). Run the Sunday scan first.")
+            st.error(f"No intraday data found for {active_date}.")
         else:
-            st.success(f"Evaluation synced to Google Sheet tab `{active_week}_{selected_risk.replace(' ', '')}`!")
+            st.success("Square-off evaluation completed and synced to Google Sheets!")
 
     sh = get_spreadsheet()
-    all_tabs = [ws.title for ws in sh.worksheets() if ws.title not in [AI_REC_TAB, HUMAN_DEC_TAB, "Sheet1"]]
+    all_tabs = [ws.title for ws in sh.worksheets() if ws.title.startswith("SQ_")]
 
     if all_tabs:
-        selected_tab = st.selectbox("Select Historical Weekly Report Tab from Google Sheets:", options=all_tabs[::-1])
-        if selected_tab:
-            ws_vals = sh.worksheet(selected_tab).get_all_values()
+        selected_sq = st.selectbox("Select Square-Off Report Tab:", options=all_tabs[::-1])
+        if selected_sq:
+            ws_vals = sh.worksheet(selected_sq).get_all_values()
             if len(ws_vals) >= 5:
                 sum_headers = ws_vals[1]
                 sum_rows = ws_vals[2:5]
                 summary_view = pd.DataFrame(sum_rows, columns=sum_headers)
-
-                st.markdown(f"#### 🏆 Cohort Performance Summary (`{selected_tab}`)")
+                st.markdown(f"#### 🏆 Intraday Cohort Summary (`{selected_sq}`)")
                 st.dataframe(summary_view, use_container_width=True)
 
-                k1, k2, k3 = st.columns(3)
-                no_ai_ret = float(summary_view.iloc[0]["Avg_Return_Pct"])
-                ai_ret = float(summary_view.iloc[1]["Avg_Return_Pct"])
-                hum_ret = float(summary_view.iloc[2]["Avg_Return_Pct"])
-
-                k1.metric("1. Without AI (Technical Baseline)", f"{no_ai_ret}%", f"Win Rate: {summary_view.iloc[0]['Win_Rate_Pct']}%")
-                k2.metric("2. With AI (Gemini Filtered)", f"{ai_ret}%", f"{round(ai_ret - no_ai_ret, 2)}% Alpha vs No-AI")
-                k3.metric("3. Human Approved (YES Picks)", f"{hum_ret}%", f"{round(hum_ret - ai_ret, 2)}% vs Raw AI")
-
-            if len(ws_vals) >= 8:
-                st.markdown("#### 🔍 Trade-by-Trade Resolution Audit")
-                aud_headers = ws_vals[7]
-                aud_rows = ws_vals[8:]
-                audit_view = pd.DataFrame(aud_rows, columns=aud_headers)
-                st.dataframe(audit_view, use_container_width=True)
-
 # ------------------------------------------
-# TAB 3: RAW GOOGLE SHEETS INSPECTOR
+# TAB 3: LIVE INSPECTOR
 # ------------------------------------------
 with tab3:
-    c_left, c_right = st.columns(2)
-    with c_left:
-        st.markdown(f"### 📄 Tab 1: `{AI_REC_TAB}`")
-        df1 = read_tab_df(AI_REC_TAB, AI_REC_COLS)
-        st.dataframe(df1, use_container_width=True)
-
-    with c_right:
-        st.markdown(f"### 👤 Tab 2: `{HUMAN_DEC_TAB}`")
-        df2 = read_tab_df(HUMAN_DEC_TAB, HUMAN_DEC_COLS)
-        st.dataframe(df2, use_container_width=True)
+    c_l, c_r = st.columns(2)
+    with c_l:
+        st.markdown(f"### 📄 `{INTRADAY_REC_TAB}`")
+        st.dataframe(read_tab_df(INTRADAY_REC_TAB, INTRADAY_REC_COLS), use_container_width=True)
+    with c_r:
+        st.markdown(f"### 👤 `{INTRADAY_DEC_TAB}`")
+        st.dataframe(read_tab_df(INTRADAY_DEC_TAB, INTRADAY_DEC_COLS), use_container_width=True)
