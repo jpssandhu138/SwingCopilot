@@ -17,9 +17,12 @@ from google.genai import types
 # 1. PAGE CONFIG & CONSTANTS
 # ==========================================
 st.set_page_config(
-    page_title="SwingCopilot AI | NSE Decision Engine",
-    page_icon="📈",
-    layout="wide"
+    # Place this right below the "st.set_page_config" call at the top of app.py
+    if os.path.exists("logo.png"):
+        st.image("logo.png", use_container_width=False, width=450)
+    else:
+        # Fallback to text title if the image hasn't been uploaded yet
+        st.title("📈 SwingCopilot AI — Retail Equity Decision & Risk Engine")
 )
 
 AI_REC_TAB = "ai_recommendations"
