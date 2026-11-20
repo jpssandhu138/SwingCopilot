@@ -709,12 +709,26 @@ with tab2:
         if selected_sq:
             ws_vals = sh.worksheet(selected_sq).get_all_values()
             if len(ws_vals) >= 5:
-                sum_headers = ws_vals[1]
-                sum_rows = ws_vals[2:5]
-                summary_view = pd.DataFrame(sum_rows, columns=sum_headers)
-                st.markdown(f"#### 🏆 Intraday Cohort Summary (`{selected_sq}`)")
-                st.dataframe(summary_view, use_container_width=True)
+                raw_headers = ws_vals[1]
+                # Keep only non-empty column headers
+                clean_headers = [h for h in raw_headers if str(h).strip() != ""]
+                num_cols = len(clean_headers)
 
+                if num_cols > 0:
+                    sum_rows = [row[:num_cols] for row in ws_vals[2:5] if any(str(c).strip() != "" for c in row[:num_cols])]
+                    summary_view = pd.DataFrame(sum_rows, columns=clean_headers)
+                    st.markdown(f"#### 🏆 Intraday Cohort Summary (`{selected_sq}`)")
+                    st.dataframe(summary_view, width="stretch")
+
+            if len(ws_vals) >= 8:
+                raw_aud_headers = ws_vals[7]
+                clean_aud_headers = [h for h in raw_aud_headers if str(h).strip() != ""]
+                aud_cols = len(clean_aud_headers)
+                if aud_cols > 0:
+                    aud_rows = [row[:aud_cols] for row in ws_vals[8:] if any(str(c).strip() != "" for c in row[:aud_cols])]
+                    audit_view = pd.DataFrame(aud_rows, columns=clean_aud_headers)
+                    st.markdown("#### 🔍 Intraday Trade-by-Trade Resolution Audit")
+                    st.dataframe(audit_view, width="stretch")
 # ------------------------------------------
 # TAB 3: LIVE INSPECTOR
 # ------------------------------------------
