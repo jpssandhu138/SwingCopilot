@@ -1,7 +1,0 @@
-streamlit
-yfinance
-google-genai
-pandas
-requests
-gspread
-google-auth
