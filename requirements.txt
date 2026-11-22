@@ -1,0 +1,10 @@
+streamlit>=1.40
+pandas>=2.0
+numpy>=1.26
+yfinance>=0.2.50
+requests
+gspread>=6.0
+google-auth
+google-genai
+pillow
+tzdata
